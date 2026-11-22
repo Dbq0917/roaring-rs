@@ -19,6 +19,13 @@ pub(crate) struct Container {
     pub store: Store,
 }
 
+fn is_contiguous(array: &ArrayStore) -> bool {
+    match (array.as_slice().first(), array.as_slice().last()) {
+        (Some(first), Some(last)) => array.len() == u64::from(last - first) + 1,
+        _ => false,
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Iter<'a> {
     pub key: u16,
@@ -107,8 +114,9 @@ impl Container {
                 } else if union_cardinality <= ARRAY_LIMIT {
                     self.store.insert_range(range)
                 } else {
-                    self.store = self.store.to_bitmap();
-                    self.store.insert_range(range)
+                    self.store.insert_range(range);
+                    self.ensure_correct_store();
+                    added_amount
                 }
             }
             Store::Run(_) => self.store.insert_range(range),
@@ -231,20 +239,54 @@ impl Container {
 
     pub(crate) fn ensure_correct_store(&mut self) -> bool {
         let new_store = match &self.store {
-            Store::Bitmap(ref bits) if bits.len() <= ARRAY_LIMIT => {
-                Store::Array(bits.to_array_store()).into()
+            Store::Bitmap(bits) if bits.len() <= ARRAY_LIMIT => {
+                let size_as_array = ArrayStore::serialized_byte_size(bits.len());
+                let num_runs = self.store.count_runs();
+                let size_as_run = IntervalStore::serialized_byte_size(num_runs);
+                if size_as_run < size_as_array {
+                    self.store.to_run()
+                } else {
+                    Store::Array(bits.to_array_store())
+                }
             }
-            Store::Array(ref vec) if vec.len() > ARRAY_LIMIT => {
-                Store::Bitmap(vec.to_bitmap_store()).into()
+            Store::Array(vec) => {
+                let size_as_array = ArrayStore::serialized_byte_size(vec.len());
+                let num_runs = if vec.len() > ARRAY_LIMIT {
+                    self.store.count_runs()
+                } else if is_contiguous(vec) {
+                    1
+                } else {
+                    return false;
+                };
+                let size_as_run = IntervalStore::serialized_byte_size(num_runs);
+                let min_size_non_run =
+                    if vec.len() > ARRAY_LIMIT { BITMAP_BYTES } else { size_as_array };
+                if size_as_run < min_size_non_run {
+                    self.store.to_run()
+                } else if vec.len() > ARRAY_LIMIT {
+                    Store::Bitmap(vec.to_bitmap_store())
+                } else {
+                    return false;
+                }
             }
-            _ => None,
+            Store::Run(runs) => {
+                let size_as_run = runs.byte_size();
+                let card = runs.len();
+                let size_as_array = ArrayStore::serialized_byte_size(card);
+                let min_size_non_run = size_as_array.min(BITMAP_BYTES);
+                if size_as_run <= min_size_non_run {
+                    return false;
+                }
+                if card <= ARRAY_LIMIT {
+                    Store::Array(runs.to_array())
+                } else {
+                    Store::Bitmap(runs.to_bitmap())
+                }
+            }
+            _ => return false,
         };
-        if let Some(new_store) = new_store {
-            self.store = new_store;
-            true
-        } else {
-            false
-        }
+        self.store = new_store;
+        true
     }
 
     pub fn optimize(&mut self) -> bool {

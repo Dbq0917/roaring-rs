@@ -144,7 +144,9 @@ fn optimize_works_for_single_shard() {
     let values = 1000_u64..10000;
     let expected = values.clone().collect::<Vec<_>>();
 
-    let mut treemap = RoaringTreemap::from_iter(values);
+    let mut bitmap = RoaringBitmap::from_iter(values.map(|value| value as u32));
+    assert!(bitmap.remove_run_compression());
+    let mut treemap = RoaringTreemap::from_bitmaps([(0, bitmap)]);
 
     assert!(treemap.optimize());
     assert_eq!(treemap.iter().collect::<Vec<_>>(), expected);

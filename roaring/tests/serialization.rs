@@ -38,7 +38,8 @@ fn test_deserialize_with_runs_from_provided_data() {
 
 #[test]
 fn test_serialize_into_provided_data() {
-    let bitmap = test_data_bitmap();
+    let mut bitmap = test_data_bitmap();
+    bitmap.remove_run_compression();
     let mut buffer = vec![];
     bitmap.serialize_into(&mut buffer).unwrap();
     assert!(BITMAP_WITHOUT_RUNS == &buffer[..]);
