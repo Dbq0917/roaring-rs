@@ -211,6 +211,25 @@ impl RoaringBitmap {
         }
     }
 
+    /// Returns the index of the container with the given `key`, appending a new
+    /// empty container if `key` doesn't match the last container.
+    ///
+    /// It is up to the caller to have validated that `key` is not smaller than
+    /// the key of the last container.
+    #[inline]
+    pub(crate) fn container_index_for_append(&mut self, key: u16) -> usize {
+        match self.containers.last() {
+            Some(container) if container.key == key => self.containers.len() - 1,
+            Some(container) if cfg!(debug_assertions) && container.key > key => {
+                panic!("last container key > key of value")
+            }
+            _ => {
+                self.containers.push(Container::new(key));
+                self.containers.len() - 1
+            }
+        }
+    }
+
     /// Searches and then modifies a specific container with `M` by the given key.
     /// Creates a new container using `B` if it doesn't exist.
     ///

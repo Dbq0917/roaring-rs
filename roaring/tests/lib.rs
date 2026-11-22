@@ -125,29 +125,33 @@ fn to_array() {
 #[test]
 fn optimize_array() {
     let mut bitmap = RoaringBitmap::from_iter(0..1000);
+    assert!(bitmap.remove_run_compression());
+    assert_eq!(bitmap.statistics().n_array_containers, 1);
     assert!(bitmap.optimize());
-    let mut bitmap = RoaringBitmap::from_iter(0..5000);
-    assert!(bitmap.optimize());
+    assert!(!bitmap.optimize());
 }
 
 #[test]
 fn optimize_bitmap() {
     let mut bitmap = RoaringBitmap::from_iter(0..5000);
+    assert!(bitmap.remove_run_compression());
+    assert_eq!(bitmap.statistics().n_bitset_containers, 1);
     assert!(bitmap.optimize());
+    assert_eq!(bitmap.statistics().n_run_containers, 1);
 }
 
 #[test]
 fn remove_run_compression() {
     let mut bitmap = RoaringBitmap::from_iter(0..5000);
-    assert!(bitmap.optimize());
+    assert_eq!(bitmap.statistics().n_run_containers, 1);
     assert!(bitmap.remove_run_compression());
 }
 
 #[test]
 fn optimize_run() {
     let mut bitmap = RoaringBitmap::from_iter(0..1000);
-    assert!(bitmap.optimize());
-    // Calling optimize a second time should return false as no changes will be made
+    assert_eq!(bitmap.statistics().n_run_containers, 1);
+    // The container was already optimized while inserting.
     assert!(!bitmap.optimize());
 }
 

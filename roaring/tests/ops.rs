@@ -28,7 +28,9 @@ fn dense_equality_checks_contents() {
 #[test]
 fn equality_across_container_representations() {
     for count in [1000, 10000] {
-        let bitmap: RoaringBitmap = (0..count).collect();
+        let mut bitmap: RoaringBitmap = (0..count).collect();
+        assert_eq!(bitmap.statistics().n_run_containers, 1);
+        assert!(bitmap.remove_run_compression());
         let stats = bitmap.statistics();
         if count < 4096 {
             assert_eq!(stats.n_array_containers, 1);

@@ -1067,21 +1067,20 @@ impl Extend<u32> for RoaringBitmap {
 
         let (mut currenthb, lowbit) = util::split(value);
         let mut current_container_index = self.find_container_by_key(currenthb);
-        let mut current_cont = &mut self.containers[current_container_index];
-        current_cont.insert(lowbit);
+        self.containers[current_container_index].insert_bulk(lowbit);
 
         for val in values {
             let (newhb, lowbit) = util::split(val);
-            if currenthb == newhb {
-                // easy case, this could be quite frequent
-                current_cont.insert(lowbit);
-            } else {
+            if currenthb != newhb {
+                // The batch of values for this container is done, check its
+                // store type once for the whole batch.
+                self.containers[current_container_index].ensure_correct_store_after_batch();
                 currenthb = newhb;
                 current_container_index = self.find_container_by_key(currenthb);
-                current_cont = &mut self.containers[current_container_index];
-                current_cont.insert(lowbit);
             }
+            self.containers[current_container_index].insert_bulk(lowbit);
         }
+        self.containers[current_container_index].ensure_correct_store_after_batch();
     }
 }
 
@@ -1183,19 +1182,30 @@ impl RoaringBitmap {
         // It is now guaranteed that so long as the values of the iterator are
         // monotonically increasing they must also be the greatest in the set.
 
-        self.push_unchecked(prev);
-
+        let (mut currenthb, lowbit) = util::split(prev);
+        let mut current_container_index = self.container_index_for_append(currenthb);
+        self.containers[current_container_index].push_unchecked_bulk(lowbit);
         let mut count = 1;
 
         for value in iterator {
             if value <= prev {
+                self.containers[current_container_index].ensure_correct_store_after_batch();
                 return Err(NonSortedIntegers { valid_until: count });
             } else {
-                self.push_unchecked(value);
+                let (newhb, lowbit) = util::split(value);
+                if newhb != currenthb {
+                    // The batch of values for this container is done, check its
+                    // store type once for the whole batch.
+                    self.containers[current_container_index].ensure_correct_store_after_batch();
+                    currenthb = newhb;
+                    current_container_index = self.container_index_for_append(newhb);
+                }
+                self.containers[current_container_index].push_unchecked_bulk(lowbit);
                 prev = value;
                 count += 1;
             }
         }
+        self.containers[current_container_index].ensure_correct_store_after_batch();
 
         Ok(count)
     }

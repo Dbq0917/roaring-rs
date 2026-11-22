@@ -47,14 +47,14 @@ impl RoaringBitmap {
     /// let statistics = bitmap.statistics();
     ///
     /// assert_eq!(statistics.n_containers, 1);
-    /// assert_eq!(statistics.n_array_containers, 1);
-    /// assert_eq!(statistics.n_run_containers, 0);
+    /// assert_eq!(statistics.n_array_containers, 0);
+    /// assert_eq!(statistics.n_run_containers, 1);
     /// assert_eq!(statistics.n_bitset_containers, 0);
-    /// assert_eq!(statistics.n_values_array_containers, 99);
-    /// assert_eq!(statistics.n_values_run_containers, 0);
+    /// assert_eq!(statistics.n_values_array_containers, 0);
+    /// assert_eq!(statistics.n_values_run_containers, 99);
     /// assert_eq!(statistics.n_values_bitset_containers, 0);
-    /// assert_eq!(statistics.n_bytes_array_containers, 512);
-    /// assert_eq!(statistics.n_bytes_run_containers, 0);
+    /// assert_eq!(statistics.n_bytes_array_containers, 0);
+    /// assert_eq!(statistics.n_bytes_run_containers, 6);
     /// assert_eq!(statistics.n_bytes_bitset_containers, 0);
     /// assert_eq!(statistics.max_value, Some(99));
     /// assert_eq!(statistics.min_value, Some(1));

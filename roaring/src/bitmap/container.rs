@@ -19,6 +19,13 @@ pub(crate) struct Container {
     pub store: Store,
 }
 
+fn is_contiguous(array: &ArrayStore) -> bool {
+    match (array.as_slice().first(), array.as_slice().last()) {
+        (Some(first), Some(last)) => array.len() == u64::from(last - first) + 1,
+        _ => false,
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Iter<'a> {
     pub key: u16,
@@ -75,6 +82,18 @@ impl Container {
         }
     }
 
+    /// Inserts `index` as part of a bulk insert, e.g. `RoaringBitmap::extend`.
+    ///
+    /// The full store type check is deferred to
+    /// [`Container::ensure_correct_store_after_batch`], which the caller must run
+    /// once per container at the end of the bulk insert. The store is still
+    /// converted eagerly as soon as it can no longer be the smallest
+    /// representation, keeping the amortized cost per inserted value constant.
+    pub(crate) fn insert_bulk(&mut self, index: u16) {
+        self.store.insert(index);
+        self.ensure_viable_store();
+    }
+
     pub fn insert_range(&mut self, range: RangeInclusive<u16>) -> u64 {
         if range.is_empty() {
             return 0;
@@ -107,8 +126,9 @@ impl Container {
                 } else if union_cardinality <= ARRAY_LIMIT {
                     self.store.insert_range(range)
                 } else {
-                    self.store = self.store.to_bitmap();
-                    self.store.insert_range(range)
+                    self.store.insert_range(range);
+                    self.ensure_correct_store();
+                    added_amount
                 }
             }
             Store::Run(_) => self.store.insert_range(range),
@@ -137,6 +157,16 @@ impl Container {
     pub(crate) fn push_unchecked(&mut self, index: u16) {
         self.store.push_unchecked(index);
         self.ensure_correct_store();
+    }
+
+    /// Pushes `index` at the end of the container as part of a bulk append.
+    ///
+    /// It is up to the caller to have validated index > self.max(), and to run
+    /// [`Container::ensure_correct_store_after_batch`] once per container at the
+    /// end of the bulk append. See [`Container::insert_bulk`].
+    pub(crate) fn push_unchecked_bulk(&mut self, index: u16) {
+        self.store.push_unchecked(index);
+        self.ensure_viable_store();
     }
 
     pub fn remove(&mut self, index: u16) -> bool {
@@ -231,19 +261,88 @@ impl Container {
 
     pub(crate) fn ensure_correct_store(&mut self) -> bool {
         let new_store = match &self.store {
-            Store::Bitmap(ref bits) if bits.len() <= ARRAY_LIMIT => {
-                Store::Array(bits.to_array_store()).into()
+            Store::Bitmap(bits) if bits.len() <= ARRAY_LIMIT => {
+                let size_as_array = ArrayStore::serialized_byte_size(bits.len());
+                let num_runs = self.store.count_runs();
+                let size_as_run = IntervalStore::serialized_byte_size(num_runs);
+                if size_as_run < size_as_array {
+                    self.store.to_run()
+                } else {
+                    Store::Array(bits.to_array_store())
+                }
             }
-            Store::Array(ref vec) if vec.len() > ARRAY_LIMIT => {
-                Store::Bitmap(vec.to_bitmap_store()).into()
+            Store::Array(vec) => {
+                let size_as_array = ArrayStore::serialized_byte_size(vec.len());
+                let num_runs = if vec.len() > ARRAY_LIMIT {
+                    self.store.count_runs()
+                } else if is_contiguous(vec) {
+                    1
+                } else {
+                    return false;
+                };
+                let size_as_run = IntervalStore::serialized_byte_size(num_runs);
+                let min_size_non_run =
+                    if vec.len() > ARRAY_LIMIT { BITMAP_BYTES } else { size_as_array };
+                if size_as_run < min_size_non_run {
+                    self.store.to_run()
+                } else if vec.len() > ARRAY_LIMIT {
+                    Store::Bitmap(vec.to_bitmap_store())
+                } else {
+                    return false;
+                }
             }
-            _ => None,
+            Store::Run(runs) => {
+                let size_as_run = runs.byte_size();
+                let card = runs.len();
+                let size_as_array = ArrayStore::serialized_byte_size(card);
+                let min_size_non_run = size_as_array.min(BITMAP_BYTES);
+                if size_as_run <= min_size_non_run {
+                    return false;
+                }
+                if card <= ARRAY_LIMIT {
+                    Store::Array(runs.to_array())
+                } else {
+                    Store::Bitmap(runs.to_bitmap())
+                }
+            }
+            _ => return false,
         };
-        if let Some(new_store) = new_store {
-            self.store = new_store;
-            true
-        } else {
-            false
+        self.store = new_store;
+        true
+    }
+
+    /// Runs the store type check once after a batch of inserts.
+    ///
+    /// Bulk inserts (e.g. `RoaringBitmap::extend` and `RoaringBitmap::append`)
+    /// defer the store type check to this method so the store is not scanned
+    /// for every inserted value. In addition to [`Container::ensure_correct_store`],
+    /// large bitmap containers are converted to run containers when the run
+    /// encoding is smaller: the per-value check skips large bitmaps because
+    /// counting their runs requires scanning the whole bitmap.
+    pub(crate) fn ensure_correct_store_after_batch(&mut self) {
+        if matches!(&self.store, Store::Bitmap(bits) if bits.len() > ARRAY_LIMIT) {
+            let num_runs = self.store.count_runs();
+            if IntervalStore::serialized_byte_size(num_runs) < BITMAP_BYTES {
+                self.store = self.store.to_run();
+                return;
+            }
+        }
+        self.ensure_correct_store();
+    }
+
+    /// Converts the store as soon as it can no longer be the smallest
+    /// representation, so that bulk inserts only run the full store type
+    /// check once per container instead of once per inserted value.
+    fn ensure_viable_store(&mut self) {
+        let is_not_viable = match &self.store {
+            Store::Array(array) => array.len() > ARRAY_LIMIT,
+            Store::Run(runs) => {
+                IntervalStore::serialized_byte_size(runs.run_amount()) > BITMAP_BYTES
+            }
+            Store::Bitmap(_) => false,
+        };
+        if is_not_viable {
+            self.ensure_correct_store();
         }
     }
 
