@@ -8,6 +8,99 @@ use roaring::RoaringBitmap;
 static BITMAP_WITHOUT_RUNS: &[u8] = include_bytes!("bitmapwithoutruns.bin");
 static BITMAP_WITH_RUNS: &[u8] = include_bytes!("bitmapwithruns.bin");
 
+// The Roaring on-disk format is defined to use little-endian byte order, independent of the
+// host's native endianness. These byte-level tests pin that contract so a regression to native
+// byte order (which silently breaks cross-platform sync between little- and big-endian machines)
+// cannot slip through the host-only round-trip tests.
+
+#[test]
+fn test_array_container_is_serialized_little_endian() {
+    // One array container (key 0x0001) holding two values whose bytes differ when byte-swapped.
+    let bitmap: RoaringBitmap = [0x0001_0001u32, 0x0001_0100].into_iter().collect();
+
+    let mut buffer = vec![];
+    bitmap.serialize_into(&mut buffer).unwrap();
+
+    #[rustfmt::skip]
+    let expected = [
+        0x3A, 0x30, 0x00, 0x00, // cookie: no run containers
+        0x01, 0x00, 0x00, 0x00, // container count: 1
+        0x01, 0x00, // container key: 0x0001 (little-endian)
+        0x01, 0x00, // cardinality - 1: 1 (little-endian)
+        0x10, 0x00, 0x00, 0x00, // offset to the container data: 16 (little-endian)
+        0x01, 0x00, // first value: 0x0001 (little-endian)
+        0x00, 0x01, // second value: 0x0100 (little-endian)
+    ];
+    assert_eq!(buffer, expected);
+    assert_eq!(RoaringBitmap::deserialize_from(&buffer[..]).unwrap(), bitmap);
+}
+
+#[test]
+fn test_bitmap_container_is_serialized_little_endian() {
+    // Force a bitmap container (> 4096 values) in the container with key 0x0001.
+    let bitmap: RoaringBitmap = (0x0001_0000..0x0001_0000 + 4097).collect();
+
+    let mut buffer = vec![];
+    bitmap.serialize_into(&mut buffer).unwrap();
+
+    // Header (16 bytes), then the 8 KiB bitmap payload of little-endian u64 words.
+    assert_eq!(buffer.len(), 16 + 8 * 1024);
+    assert_eq!(&buffer[..4], &[0x3A, 0x30, 0x00, 0x00]);
+    assert_eq!(&buffer[8..10], &[0x01, 0x00]); // key: 0x0001 (little-endian)
+
+    // The first 4097 set bits occupy 64 full little-endian u64 words (all 0xFF..FF) followed by
+    // one word with only its lowest bit set: 0x0000_0000_0000_0001 on every host.
+    let payload = &buffer[16..];
+    for word in payload.chunks_exact(8).take(64) {
+        assert_eq!(word, &[0xFF; 8]);
+    }
+    assert_eq!(&payload[64 * 8..65 * 8], &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+
+    assert_eq!(RoaringBitmap::deserialize_from(&buffer[..]).unwrap(), bitmap);
+}
+
+#[test]
+fn test_run_container_is_serialized_little_endian() {
+    // A single run [0x0001, 0x0100] inside the container with key 0x0001.
+    let mut bitmap: RoaringBitmap = (0x0001_0001..=0x0001_0100).collect();
+    bitmap.optimize();
+
+    let mut buffer = vec![];
+    bitmap.serialize_into(&mut buffer).unwrap();
+
+    #[rustfmt::skip]
+    let expected = [
+        0x3B, 0x30, 0x00, 0x00, // cookie: run containers, container count - 1: 0
+        0x01, // run container bitset: the only container is a run container
+        0x01, 0x00, // container key: 0x0001 (little-endian)
+        0xFF, 0x00, // cardinality - 1: 0x00FF (little-endian)
+        0x01, 0x00, // number of runs: 1 (little-endian)
+        0x01, 0x00, // run start: 0x0001 (little-endian)
+        0xFF, 0x00, // run length - 1: 0x00FF (little-endian)
+    ];
+    assert_eq!(buffer, expected);
+    assert_eq!(RoaringBitmap::deserialize_from(&buffer[..]).unwrap(), bitmap);
+}
+
+#[test]
+fn test_deserialize_rejects_big_endian_encoding() {
+    // Same logical bitmap as `test_array_container_is_serialized_little_endian`, but with every
+    // multi-byte field written big-endian (the old native-endian output of a big-endian host).
+    #[rustfmt::skip]
+    let big_endian = [
+        0x00, 0x00, 0x30, 0x3A, // cookie byte-swapped: no longer recognized
+        0x00, 0x00, 0x00, 0x01, // container count: 1 (big-endian)
+        0x00, 0x01, // container key: 0x0001 (big-endian)
+        0x00, 0x01, // cardinality - 1: 1 (big-endian)
+        0x00, 0x00, 0x00, 0x10, // offset: 16 (big-endian)
+        0x00, 0x01, // first value: 0x0001 (big-endian)
+        0x01, 0x00, // second value: 0x0100 (big-endian)
+    ];
+    // The byte-swapped cookie must not be accepted: reading foreign-endian files as if they were
+    // little-endian is exactly how scrambled ids were produced during cross-platform sync.
+    assert!(RoaringBitmap::deserialize_from(&big_endian[..]).is_err());
+}
+
 fn test_data_bitmap() -> RoaringBitmap {
     (0..100)
         .map(|i| i * 1000)

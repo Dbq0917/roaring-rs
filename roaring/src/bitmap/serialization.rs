@@ -4,7 +4,9 @@ use crate::bitmap::store::{
     RUN_NUM_BYTES,
 };
 use crate::RoaringBitmap;
-use bytemuck::{cast_slice, cast_slice_mut};
+#[cfg(target_endian = "little")]
+use bytemuck::cast_slice;
+use bytemuck::cast_slice_mut;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use core::convert::Infallible;
 use std::error::Error;
