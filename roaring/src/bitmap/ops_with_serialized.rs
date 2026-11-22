@@ -4,7 +4,6 @@ use core::convert::Infallible;
 use std::error::Error;
 use std::io::{self, SeekFrom};
 use std::mem;
-use std::ops::RangeInclusive;
 
 use crate::bitmap::container::Container;
 use crate::bitmap::serialization::{
@@ -13,7 +12,7 @@ use crate::bitmap::serialization::{
 use crate::RoaringBitmap;
 
 use super::container::ARRAY_LIMIT;
-use super::store::{ArrayStore, BitmapStore, Store, BITMAP_LENGTH};
+use super::store::{ArrayStore, BitmapStore, Interval, IntervalStore, Store, BITMAP_LENGTH};
 
 impl RoaringBitmap {
     /// Computes the intersection between a materialized [`RoaringBitmap`] and a serialized one.
@@ -130,25 +129,7 @@ impl RoaringBitmap {
             let store = if is_run_container {
                 let runs = reader.read_u16::<LittleEndian>()?;
                 match container {
-                    Some(_) => {
-                        let mut intervals = vec![[0, 0]; runs as usize];
-                        reader.read_exact(cast_slice_mut(&mut intervals))?;
-                        intervals.iter_mut().for_each(|[s, len]| {
-                            *s = u16::from_le(*s);
-                            *len = u16::from_le(*len);
-                        });
-
-                        let cardinality = intervals.iter().map(|[_, len]| *len as usize).sum();
-                        let mut store = Store::with_capacity(cardinality);
-                        intervals.into_iter().try_for_each(
-                            |[s, len]| -> Result<(), io::ErrorKind> {
-                                let end = s.checked_add(len).ok_or(io::ErrorKind::InvalidData)?;
-                                store.insert_range(RangeInclusive::new(s, end));
-                                Ok(())
-                            },
-                        )?;
-                        store
-                    }
+                    Some(_) => read_run_container_store(&mut reader, runs)?,
                     None => {
                         let runs_size = mem::size_of::<u16>() * 2 * runs as usize;
                         reader.seek(SeekFrom::Current(runs_size as i64))?;
@@ -235,22 +216,8 @@ impl RoaringBitmap {
                 run_container_bitmap.as_ref().is_some_and(|bm| bm[i / 8] & (1 << (i % 8)) != 0);
 
             let store = if is_run_container {
-                let runs = reader.read_u16::<LittleEndian>().unwrap();
-                let mut intervals = vec![[0, 0]; runs as usize];
-                reader.read_exact(cast_slice_mut(&mut intervals)).unwrap();
-                intervals.iter_mut().for_each(|[s, len]| {
-                    *s = u16::from_le(*s);
-                    *len = u16::from_le(*len);
-                });
-
-                let cardinality = intervals.iter().map(|[_, len]| *len as usize).sum();
-                let mut store = Store::with_capacity(cardinality);
-                intervals.into_iter().try_for_each(|[s, len]| -> Result<(), io::ErrorKind> {
-                    let end = s.checked_add(len).ok_or(io::ErrorKind::InvalidData)?;
-                    store.insert_range(RangeInclusive::new(s, end));
-                    Ok(())
-                })?;
-                store
+                let runs = reader.read_u16::<LittleEndian>()?;
+                read_run_container_store(&mut reader, runs)?
             } else if cardinality <= ARRAY_LIMIT {
                 let mut values = vec![0; cardinality as usize];
                 reader.read_exact(cast_slice_mut(&mut values)).unwrap();
@@ -277,6 +244,40 @@ impl RoaringBitmap {
     }
 }
 
+/// Reads a run container from the serialized stream, keeping it as a [`Store::Run`].
+///
+/// Keeping the run encoding lets the intersection dispatch compute directly on the
+/// combination of container types instead of materializing an intermediate bitmap store.
+fn read_run_container_store<R: io::Read>(reader: &mut R, runs: u16) -> io::Result<Store> {
+    if runs == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "run container with zero runs"));
+    }
+    let mut intervals = vec![[0, 0]; runs as usize];
+    reader.read_exact(cast_slice_mut(&mut intervals))?;
+    intervals.iter_mut().for_each(|[s, len]| {
+        *s = u16::from_le(*s);
+        *len = u16::from_le(*len);
+    });
+
+    let mut last_end = None::<u16>;
+    let store = IntervalStore::from_vec_unchecked(
+        intervals
+            .into_iter()
+            .map(|[s, len]| -> Result<Interval, io::ErrorKind> {
+                let end = s.checked_add(len).ok_or(io::ErrorKind::InvalidData)?;
+                if let Some(last_end) = last_end.replace(end) {
+                    if s <= last_end.saturating_add(1) {
+                        // Range overlaps or would be contiguous with the previous range
+                        return Err(io::ErrorKind::InvalidData);
+                    }
+                }
+                Ok(Interval::new_unchecked(s, end))
+            })
+            .collect::<Result<_, _>>()?,
+    );
+    Ok(Store::Run(store))
+}
+
 #[cfg(test)]
 mod test {
     use crate::RoaringBitmap;
@@ -296,5 +297,24 @@ mod test {
 
             prop_assert_eq!(a.intersection_with_serialized_unchecked(Cursor::new(serialized_bytes_b)).unwrap(), a & b);
         }
+    }
+
+    #[test]
+    fn intersection_with_serialized_run_container() {
+        // The serialized side holds run containers with a cardinality above
+        // ARRAY_LIMIT, the materialized side holds array containers.
+        let mut runs = RoaringBitmap::new();
+        runs.insert_range(5..20_000);
+        runs.insert_range(30_000..60_000);
+        runs.optimize();
+
+        let arrays: RoaringBitmap = (0..1_000u32).map(|i| i * 30).collect();
+
+        let mut serialized_bytes = Vec::new();
+        runs.serialize_into(&mut serialized_bytes).unwrap();
+
+        let result =
+            arrays.intersection_with_serialized_unchecked(Cursor::new(serialized_bytes)).unwrap();
+        assert_eq!(result, &arrays & &runs);
     }
 }

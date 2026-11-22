@@ -47,15 +47,6 @@ impl Store {
         Store::Array(ArrayStore::new())
     }
 
-    #[cfg(feature = "std")]
-    pub fn with_capacity(capacity: usize) -> Store {
-        if capacity <= ARRAY_LIMIT as usize {
-            Store::Array(ArrayStore::with_capacity(capacity))
-        } else {
-            Store::Bitmap(BitmapStore::new())
-        }
-    }
-
     pub fn full() -> Store {
         Store::Run(IntervalStore::full())
     }
